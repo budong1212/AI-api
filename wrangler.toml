@@ -1,4 +1,4 @@
-name = "unlimited-transfer-api"
+name = "ai-api"
 main = "src/worker.js"
 compatibility_date = "2025-11-21"
 
