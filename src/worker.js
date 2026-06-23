@@ -2,13 +2,6 @@ const DEFAULT_UPSTREAM_BASE_URL = "https://unlimited.surf";
 const DEFAULT_OPENAI_MODEL = "gateway-gpt-5-5";
 const DEFAULT_CLAUDE_MODEL = "claude-opus-4-7-20260101";
 
-const TOOL_CALL_INSTRUCTION = [
-  "When you need to call a tool, respond with ONLY a JSON object (no markdown, no extra text) in this format:",
-  '{"tool_calls":[{"id":"call_<unique>","type":"function","function":{"name":"<tool_name>","arguments":"<JSON string of arguments>"}}]}',
-  "For multiple tools, include multiple entries in the tool_calls array.",
-  "If no tool is needed, respond with normal text.",
-].join("\n");
-
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
@@ -127,37 +120,31 @@ async function openAIDirectCapability(request, env, body, route) {
   const created = nowSeconds();
   const id = `chatcmpl_${randomId()}`;
   const payload = buildUnlimitedPayload({ ...body, web_search: route === "/api/search", merge: route === "/api/merge" }, route);
-  const withTools = hasClientTools(body.tools);
+
+  if (body.stream !== false && !hasEmulatableTools(body.tools)) {
+    const upstream = await callUnlimitedStream(request, env, route, payload);
+    return sseResponse(streamOpenAIChat(upstream, { id, created, model }));
+  }
+
+  const result = finalizeToolResult(await collectUnlimitedText(request, env, route, payload), body);
 
   if (body.stream !== false) {
-    const upstream = await callUnlimitedStream(request, env, route, payload);
-    return sseResponse(withTools
-      ? streamOpenAIChatWithTools(upstream, { id, created, model })
-      : streamOpenAIChat(upstream, { id, created, model }));
+    return sseResponse(streamSyntheticOpenAIChat(result, {
+      id,
+      created,
+      model,
+      systemFingerprint: `unlimited-surf-worker:${route}`,
+      inputText: payload.message || payload.query || "",
+    }));
   }
 
-  const result = await collectUnlimitedText(request, env, route, payload);
-  const toolCalls = withTools ? parseToolCallsFromText(result.text) : null;
-  if (toolCalls) {
-    return jsonResponse(buildOpenAIToolCompletion({ id, created, model, toolCalls, inputText: payload.message || payload.query || "" }));
-  }
-
-  return jsonResponse({
+  return jsonResponse(buildOpenAIChatCompletion(result, {
     id,
-    object: "chat.completion",
     created,
     model,
-    choices: [
-      {
-        index: 0,
-        message: { role: "assistant", content: result.text },
-        logprobs: null,
-        finish_reason: result.finishReason || "stop",
-      },
-    ],
-    usage: usageFromText(payload.message || payload.query || "", result.text),
-    system_fingerprint: `unlimited-surf-worker:${route}`,
-  });
+    inputText: payload.message || payload.query || "",
+    systemFingerprint: `unlimited-surf-worker:${route}`,
+  }));
 }
 
 async function openAIChatCompletions(request, env, body) {
@@ -166,37 +153,31 @@ async function openAIChatCompletions(request, env, body) {
   const id = `chatcmpl_${randomId()}`;
   const route = chooseUnlimitedRoute(body);
   const payload = buildUnlimitedPayload(body, route);
-  const withTools = hasClientTools(body.tools);
+
+  if (body.stream && !hasEmulatableTools(body.tools)) {
+    const upstream = await callUnlimitedStream(request, env, route, payload);
+    return sseResponse(streamOpenAIChat(upstream, { id, created, model }));
+  }
+
+  const result = finalizeToolResult(await collectUnlimitedText(request, env, route, payload), body);
 
   if (body.stream) {
-    const upstream = await callUnlimitedStream(request, env, route, payload);
-    return sseResponse(withTools
-      ? streamOpenAIChatWithTools(upstream, { id, created, model })
-      : streamOpenAIChat(upstream, { id, created, model }));
+    return sseResponse(streamSyntheticOpenAIChat(result, {
+      id,
+      created,
+      model,
+      systemFingerprint: "unlimited-surf-worker",
+      inputText: payload.message || "",
+    }));
   }
 
-  const result = await collectUnlimitedText(request, env, route, payload);
-  const toolCalls = withTools ? parseToolCallsFromText(result.text) : null;
-  if (toolCalls) {
-    return jsonResponse(buildOpenAIToolCompletion({ id, created, model, toolCalls, inputText: payload.message || "" }));
-  }
-
-  return jsonResponse({
+  return jsonResponse(buildOpenAIChatCompletion(result, {
     id,
-    object: "chat.completion",
     created,
     model,
-    choices: [
-      {
-        index: 0,
-        message: { role: "assistant", content: result.text },
-        logprobs: null,
-        finish_reason: result.finishReason || "stop",
-      },
-    ],
-    usage: usageFromText(payload.message || "", result.text),
-    system_fingerprint: "unlimited-surf-worker",
-  });
+    inputText: payload.message || "",
+    systemFingerprint: "unlimited-surf-worker",
+  }));
 }
 
 async function openAIResponses(request, env, body) {
@@ -206,54 +187,31 @@ async function openAIResponses(request, env, body) {
   const syntheticChatBody = responsesToChatBody(body, model);
   const route = chooseUnlimitedRoute(syntheticChatBody);
   const payload = buildUnlimitedPayload(syntheticChatBody, route);
-  const withTools = hasClientTools(body.tools);
+
+  if (body.stream && !hasEmulatableTools(body.tools)) {
+    const upstream = await callUnlimitedStream(request, env, route, payload);
+    return sseResponse(streamOpenAIResponses(upstream, { id, created, model }));
+  }
+
+  const result = finalizeToolResult(await collectUnlimitedText(request, env, route, payload), body);
 
   if (body.stream) {
-    const upstream = await callUnlimitedStream(request, env, route, payload);
-    return sseResponse(withTools
-      ? streamOpenAIResponsesWithTools(upstream, { id, created, model })
-      : streamOpenAIResponses(upstream, { id, created, model }));
+    return sseResponse(streamSyntheticOpenAIResponse(result, {
+      id,
+      created,
+      model,
+      body,
+      inputText: payload.message || "",
+    }));
   }
 
-  const result = await collectUnlimitedText(request, env, route, payload);
-  const toolCalls = withTools ? parseToolCallsFromText(result.text) : null;
-  if (toolCalls) {
-    return jsonResponse(buildOpenAIResponsesToolResult({ id, created, model, body, toolCalls, inputText: payload.message || "" }));
-  }
-
-  return jsonResponse({
+  return jsonResponse(buildOpenAIResponse(result, {
     id,
-    object: "response",
-    created_at: created,
-    status: "completed",
-    error: null,
-    incomplete_details: null,
-    instructions: body.instructions || null,
-    max_output_tokens: body.max_output_tokens || body.max_tokens || null,
+    created,
     model,
-    output: [
-      {
-        id: `msg_${randomId()}`,
-        type: "message",
-        status: "completed",
-        role: "assistant",
-        content: [{ type: "output_text", text: result.text, annotations: [] }],
-      },
-    ],
-    output_text: result.text,
-    parallel_tool_calls: true,
-    previous_response_id: body.previous_response_id || null,
-    reasoning: body.reasoning || null,
-    store: body.store || false,
-    temperature: body.temperature || null,
-    text: body.text || { format: { type: "text" } },
-    tool_choice: body.tool_choice || "auto",
-    tools: body.tools || [],
-    top_p: body.top_p || null,
-    truncation: body.truncation || "disabled",
-    usage: responseUsageFromText(payload.message || "", result.text),
-    user: body.user || null,
-  });
+    body,
+    inputText: payload.message || "",
+  }));
 }
 
 async function handleAnthropic(request, env, path) {
@@ -297,31 +255,27 @@ async function anthropicDirectCapability(request, env, body, route) {
   const requestedModel = body.model || env.DEFAULT_CLAUDE_MODEL || DEFAULT_CLAUDE_MODEL;
   const payload = buildAnthropicUnlimitedPayload({ ...body, web_search: route === "/api/search", merge: route === "/api/merge" }, route);
   const id = `msg_${randomId()}`;
-  const withTools = hasClientTools(body.tools);
+
+  if (body.stream !== false && !hasEmulatableTools(body.tools)) {
+    const upstream = await callUnlimitedStream(request, env, route, payload);
+    return sseResponse(streamAnthropicMessages(upstream, { id, model: requestedModel }));
+  }
+
+  const result = finalizeToolResult(await collectUnlimitedText(request, env, route, payload), body);
 
   if (body.stream !== false) {
-    const upstream = await callUnlimitedStream(request, env, route, payload);
-    return sseResponse(withTools
-      ? streamAnthropicMessagesWithTools(upstream, { id, model: requestedModel })
-      : streamAnthropicMessages(upstream, { id, model: requestedModel }));
+    return sseResponse(streamSyntheticAnthropicMessage(result, {
+      id,
+      model: requestedModel,
+      inputText: payload.message || payload.query || "",
+    }));
   }
 
-  const result = await collectUnlimitedText(request, env, route, payload);
-  const toolCalls = withTools ? parseToolCallsFromText(result.text) : null;
-  if (toolCalls) {
-    return jsonResponse(buildAnthropicToolMessage({ id, model: requestedModel, toolCalls, inputText: payload.message || payload.query || "" }));
-  }
-
-  return jsonResponse({
+  return jsonResponse(buildAnthropicMessage(result, {
     id,
-    type: "message",
-    role: "assistant",
     model: requestedModel,
-    content: [{ type: "text", text: result.text }],
-    stop_reason: anthropicStopReason(result.finishReason),
-    stop_sequence: null,
-    usage: anthropicUsageFromText(payload.message || payload.query || "", result.text),
-  });
+    inputText: payload.message || payload.query || "",
+  }));
 }
 
 async function anthropicMessages(request, env, body) {
@@ -329,31 +283,27 @@ async function anthropicMessages(request, env, body) {
   const route = chooseUnlimitedRoute(body);
   const payload = buildAnthropicUnlimitedPayload(body, route);
   const id = `msg_${randomId()}`;
-  const withTools = hasClientTools(body.tools);
+
+  if (body.stream && !hasEmulatableTools(body.tools)) {
+    const upstream = await callUnlimitedStream(request, env, route, payload);
+    return sseResponse(streamAnthropicMessages(upstream, { id, model: requestedModel }));
+  }
+
+  const result = finalizeToolResult(await collectUnlimitedText(request, env, route, payload), body);
 
   if (body.stream) {
-    const upstream = await callUnlimitedStream(request, env, route, payload);
-    return sseResponse(withTools
-      ? streamAnthropicMessagesWithTools(upstream, { id, model: requestedModel })
-      : streamAnthropicMessages(upstream, { id, model: requestedModel }));
+    return sseResponse(streamSyntheticAnthropicMessage(result, {
+      id,
+      model: requestedModel,
+      inputText: payload.message || "",
+    }));
   }
 
-  const result = await collectUnlimitedText(request, env, route, payload);
-  const toolCalls = withTools ? parseToolCallsFromText(result.text) : null;
-  if (toolCalls) {
-    return jsonResponse(buildAnthropicToolMessage({ id, model: requestedModel, toolCalls, inputText: payload.message || "" }));
-  }
-
-  return jsonResponse({
+  return jsonResponse(buildAnthropicMessage(result, {
     id,
-    type: "message",
-    role: "assistant",
     model: requestedModel,
-    content: [{ type: "text", text: result.text }],
-    stop_reason: anthropicStopReason(result.finishReason),
-    stop_sequence: null,
-    usage: anthropicUsageFromText(payload.message || "", result.text),
-  });
+    inputText: payload.message || "",
+  }));
 }
 
 async function openAIModels(request, env) {
@@ -422,7 +372,6 @@ async function openAIFileUpload(request, env) {
 function chooseUnlimitedRoute(body) {
   if (body.models && Array.isArray(body.models) && body.models.length >= 2) return "/api/merge";
   if (body.merge || body.merge_ai) return "/api/merge";
-  if (hasClientTools(body.tools)) return "/api/chat";
   if (body.query || body.web_search || body.web_search_options || hasWebSearchTool(body.tools)) return "/api/search";
   return "/api/chat";
 }
@@ -430,14 +379,19 @@ function chooseUnlimitedRoute(body) {
 function buildUnlimitedPayload(body, route) {
   if (route === "/api/search") {
     return {
+      ...body,
       query: body.query || latestUserText(body.messages) || inputToText(body.input) || body.prompt || "",
       model: mapUpstreamModel(body.model),
       effort: body.effort || reasoningEffort(body),
     };
   }
 
-  const message = buildChatMessageText(body);
+  const message = applyToolPrompt(
+    body.message || messagesToText(body.messages) || inputToText(body.input) || body.prompt || "",
+    body
+  );
   const payload = {
+    ...body,
     message,
     model: mapUpstreamModel(body.model),
     effort: body.effort || reasoningEffort(body),
@@ -453,14 +407,16 @@ function buildUnlimitedPayload(body, route) {
 function buildAnthropicUnlimitedPayload(body, route) {
   if (route === "/api/search") {
     return {
+      ...body,
       query: latestUserText(body.messages) || body.query || "",
       model: mapUpstreamModel(body.model),
       effort: body.effort || reasoningEffort(body),
     };
   }
 
-  const prompt = buildChatMessageText(body);
+  const prompt = applyToolPrompt(anthropicMessagesToText(body), body);
   const payload = {
+    ...body,
     message: prompt,
     model: mapUpstreamModel(body.model),
     effort: body.effort || reasoningEffort(body),
@@ -476,16 +432,547 @@ function buildAnthropicUnlimitedPayload(body, route) {
 function responsesToChatBody(body, fallbackModel) {
   const messages = [];
   if (body.instructions) messages.push({ role: "system", content: body.instructions });
-  const inputText = inputToText(body.input);
-  if (inputText) messages.push({ role: "user", content: inputText });
+  messages.push(...responsesInputToMessages(body.input));
 
   return {
     ...body,
     model: body.model || fallbackModel,
     messages,
-    tools: body.tools,
     stream: body.stream,
   };
+}
+
+function responsesInputToMessages(input) {
+  if (!input) return [];
+  if (typeof input === "string") return [{ role: "user", content: input }];
+  if (!Array.isArray(input)) return [{ role: "user", content: contentToText(input) }];
+
+  const messages = [];
+  for (const item of input) {
+    if (typeof item === "string") {
+      messages.push({ role: "user", content: item });
+      continue;
+    }
+
+    if (!item || typeof item !== "object") continue;
+
+    if (item.type === "message" || item.role) {
+      messages.push({ role: item.role || "user", content: item.content || item.text || "" });
+      continue;
+    }
+
+    if (item.type === "function_call") {
+      messages.push({
+        role: "assistant",
+        content: "",
+        tool_calls: [
+          {
+            id: item.call_id || item.id || `call_${randomId()}`,
+            type: "function",
+            function: {
+              name: item.name || item.function?.name || "tool",
+              arguments: typeof item.arguments === "string" ? item.arguments : JSON.stringify(item.arguments || {}),
+            },
+          },
+        ],
+      });
+      continue;
+    }
+
+    if (item.type === "function_call_output") {
+      messages.push({
+        role: "tool",
+        tool_call_id: item.call_id || item.id || "",
+        name: item.name || item.tool_name || "tool",
+        content: item.output || item.content || "",
+      });
+      continue;
+    }
+
+    if (item.type === "input_text" || item.type === "output_text") {
+      messages.push({ role: "user", content: item.text || "" });
+      continue;
+    }
+  }
+
+  return messages;
+}
+
+function finalizeToolResult(result, body) {
+  if (result.toolCalls && result.toolCalls.length > 0) return result;
+  const parsedToolCalls = parseToolCallsFromText(result.text, body.tools);
+  if (!parsedToolCalls.length) return result;
+
+  return {
+    ...result,
+    text: stripToolCallMarkup(result.text),
+    toolCalls: parsedToolCalls,
+    finishReason: "tool_calls",
+  };
+}
+
+function buildOpenAIChatCompletion(result, meta) {
+  const messageObj = {
+    role: "assistant",
+    content: result.text || "",
+  };
+  if (result.toolCalls && result.toolCalls.length > 0) {
+    messageObj.tool_calls = result.toolCalls;
+    if (!result.text) messageObj.content = "";
+  }
+
+  return {
+    id: meta.id,
+    object: "chat.completion",
+    created: meta.created,
+    model: meta.model,
+    choices: [
+      {
+        index: 0,
+        message: messageObj,
+        logprobs: null,
+        finish_reason: result.finishReason || (result.toolCalls ? "tool_calls" : "stop"),
+      },
+    ],
+    usage: usageFromText(meta.inputText || "", result.text || ""),
+    system_fingerprint: meta.systemFingerprint,
+  };
+}
+
+function buildOpenAIResponse(result, meta) {
+  const output = [];
+
+  if (result.text) {
+    output.push({
+      id: `msg_${randomId()}`,
+      type: "message",
+      status: "completed",
+      role: "assistant",
+      content: [{ type: "output_text", text: result.text, annotations: [] }],
+    });
+  }
+
+  if (result.toolCalls && result.toolCalls.length > 0) {
+    for (const toolCall of result.toolCalls) {
+      output.push({
+        id: toolCall.id,
+        type: "function_call",
+        status: "completed",
+        call_id: toolCall.id,
+        name: toolCall.function.name,
+        arguments: toolCall.function.arguments,
+      });
+    }
+  }
+
+  if (!output.length) {
+    output.push({
+      id: `msg_${randomId()}`,
+      type: "message",
+      status: "completed",
+      role: "assistant",
+      content: [{ type: "output_text", text: "", annotations: [] }],
+    });
+  }
+
+  return {
+    id: meta.id,
+    object: "response",
+    created_at: meta.created,
+    status: "completed",
+    error: null,
+    incomplete_details: null,
+    instructions: meta.body.instructions || null,
+    max_output_tokens: meta.body.max_output_tokens || meta.body.max_tokens || null,
+    model: meta.model,
+    output,
+    output_text: result.text || "",
+    parallel_tool_calls: true,
+    previous_response_id: meta.body.previous_response_id || null,
+    reasoning: meta.body.reasoning || null,
+    store: meta.body.store || false,
+    temperature: meta.body.temperature || null,
+    text: meta.body.text || { format: { type: "text" } },
+    tool_choice: meta.body.tool_choice || "auto",
+    tools: meta.body.tools || [],
+    top_p: meta.body.top_p || null,
+    truncation: meta.body.truncation || "disabled",
+    usage: responseUsageFromText(meta.inputText || "", result.text || ""),
+    user: meta.body.user || null,
+  };
+}
+
+function buildAnthropicMessage(result, meta) {
+  const content = [];
+  if (result.text) content.push({ type: "text", text: result.text });
+  if (result.toolCalls && result.toolCalls.length > 0) {
+    for (const toolCall of result.toolCalls) {
+      content.push({
+        type: "tool_use",
+        id: toolCall.id,
+        name: toolCall.function.name,
+        input: safeJsonParse(toolCall.function.arguments, {}),
+      });
+    }
+  }
+  if (!content.length) content.push({ type: "text", text: "" });
+
+  return {
+    id: meta.id,
+    type: "message",
+    role: "assistant",
+    model: meta.model,
+    content,
+    stop_reason: result.toolCalls && result.toolCalls.length > 0 ? "tool_use" : anthropicStopReason(result.finishReason),
+    stop_sequence: null,
+    usage: anthropicUsageFromText(meta.inputText || "", result.text || ""),
+  };
+}
+
+function streamSyntheticOpenAIChat(result, meta) {
+  return new ReadableStream({
+    start(controller) {
+      writeSse(controller, {
+        id: meta.id,
+        object: "chat.completion.chunk",
+        created: meta.created,
+        model: meta.model,
+        choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
+      });
+
+      if (result.text) {
+        writeSse(controller, {
+          id: meta.id,
+          object: "chat.completion.chunk",
+          created: meta.created,
+          model: meta.model,
+          choices: [{ index: 0, delta: { content: result.text }, finish_reason: null }],
+        });
+      }
+
+      if (result.toolCalls && result.toolCalls.length > 0) {
+        writeSse(controller, {
+          id: meta.id,
+          object: "chat.completion.chunk",
+          created: meta.created,
+          model: meta.model,
+          choices: [{ index: 0, delta: { tool_calls: result.toolCalls }, finish_reason: null }],
+        });
+      }
+
+      writeSse(controller, {
+        id: meta.id,
+        object: "chat.completion.chunk",
+        created: meta.created,
+        model: meta.model,
+        choices: [{ index: 0, delta: {}, finish_reason: result.toolCalls && result.toolCalls.length > 0 ? "tool_calls" : "stop" }],
+      });
+      writeRawSse(controller, "data: [DONE]\n\n");
+      controller.close();
+    },
+  });
+}
+
+function streamSyntheticOpenAIResponse(result, meta) {
+  return new ReadableStream({
+    start(controller) {
+      writeSseEvent(controller, "response.created", {
+        type: "response.created",
+        response: {
+          id: meta.id,
+          object: "response",
+          created_at: meta.created,
+          status: "in_progress",
+          model: meta.model,
+          output: [],
+        },
+      });
+
+      if (result.text) {
+        const outputId = `msg_${randomId()}`;
+        writeSseEvent(controller, "response.output_item.added", {
+          type: "response.output_item.added",
+          output_index: 0,
+          item: { id: outputId, type: "message", status: "in_progress", role: "assistant", content: [] },
+        });
+        writeSseEvent(controller, "response.content_part.added", {
+          type: "response.content_part.added",
+          item_id: outputId,
+          output_index: 0,
+          content_index: 0,
+          part: { type: "output_text", text: "", annotations: [] },
+        });
+        writeSseEvent(controller, "response.output_text.delta", {
+          type: "response.output_text.delta",
+          item_id: outputId,
+          output_index: 0,
+          content_index: 0,
+          delta: result.text,
+        });
+        writeSseEvent(controller, "response.output_text.done", {
+          type: "response.output_text.done",
+          item_id: outputId,
+          output_index: 0,
+          content_index: 0,
+          text: result.text,
+        });
+        writeSseEvent(controller, "response.content_part.done", {
+          type: "response.content_part.done",
+          item_id: outputId,
+          output_index: 0,
+          content_index: 0,
+          part: { type: "output_text", text: result.text, annotations: [] },
+        });
+        writeSseEvent(controller, "response.output_item.done", {
+          type: "response.output_item.done",
+          output_index: 0,
+          item: { id: outputId, type: "message", status: "completed", role: "assistant", content: [] },
+        });
+      }
+
+      if (result.toolCalls && result.toolCalls.length > 0) {
+        result.toolCalls.forEach((toolCall, index) => {
+          const outputIndex = result.text ? index + 1 : index;
+          const item = {
+            id: toolCall.id,
+            type: "function_call",
+            status: "completed",
+            call_id: toolCall.id,
+            name: toolCall.function.name,
+            arguments: toolCall.function.arguments,
+          };
+          writeSseEvent(controller, "response.output_item.added", {
+            type: "response.output_item.added",
+            output_index: outputIndex,
+            item,
+          });
+          writeSseEvent(controller, "response.output_item.done", {
+            type: "response.output_item.done",
+            output_index: outputIndex,
+            item,
+          });
+        });
+      }
+
+      writeSseEvent(controller, "response.completed", {
+        type: "response.completed",
+        response: {
+          id: meta.id,
+          object: "response",
+          created_at: meta.created,
+          status: "completed",
+          model: meta.model,
+        },
+      });
+      writeRawSse(controller, "data: [DONE]\n\n");
+      controller.close();
+    },
+  });
+}
+
+function streamSyntheticAnthropicMessage(result, meta) {
+  return new ReadableStream({
+    start(controller) {
+      writeSseEvent(controller, "message_start", {
+        type: "message_start",
+        message: {
+          id: meta.id,
+          type: "message",
+          role: "assistant",
+          model: meta.model,
+          content: [],
+          stop_reason: null,
+          stop_sequence: null,
+          usage: anthropicUsageFromText(meta.inputText || "", result.text || ""),
+        },
+      });
+
+      let index = 0;
+      if (result.text) {
+        writeSseEvent(controller, "content_block_start", {
+          type: "content_block_start",
+          index,
+          content_block: { type: "text", text: "" },
+        });
+        writeSseEvent(controller, "content_block_delta", {
+          type: "content_block_delta",
+          index,
+          delta: { type: "text_delta", text: result.text },
+        });
+        writeSseEvent(controller, "content_block_stop", { type: "content_block_stop", index });
+        index += 1;
+      }
+
+      if (result.toolCalls && result.toolCalls.length > 0) {
+        for (const toolCall of result.toolCalls) {
+          writeSseEvent(controller, "content_block_start", {
+            type: "content_block_start",
+            index,
+            content_block: {
+              type: "tool_use",
+              id: toolCall.id,
+              name: toolCall.function.name,
+              input: safeJsonParse(toolCall.function.arguments, {}),
+            },
+          });
+          writeSseEvent(controller, "content_block_stop", { type: "content_block_stop", index });
+          index += 1;
+        }
+      }
+
+      writeSseEvent(controller, "message_delta", {
+        type: "message_delta",
+        delta: {
+          stop_reason: result.toolCalls && result.toolCalls.length > 0 ? "tool_use" : anthropicStopReason(result.finishReason),
+          stop_sequence: null,
+        },
+        usage: anthropicUsageFromText(meta.inputText || "", result.text || ""),
+      });
+      writeSseEvent(controller, "message_stop", { type: "message_stop" });
+      controller.close();
+    },
+  });
+}
+
+function hasEmulatableTools(tools) {
+  return normalizeEmulatableTools(tools).length > 0;
+}
+
+function normalizeEmulatableTools(tools) {
+  if (!Array.isArray(tools)) return [];
+  return tools.map((tool) => {
+    if (!tool || typeof tool !== "object") return null;
+    if (tool.type === "function" && tool.function && tool.function.name) {
+      return {
+        name: tool.function.name,
+        description: tool.function.description || "",
+        parameters: tool.function.parameters || {},
+      };
+    }
+    if (tool.name) {
+      return {
+        name: tool.name,
+        description: tool.description || "",
+        parameters: tool.input_schema || tool.parameters || {},
+      };
+    }
+    return null;
+  }).filter(Boolean);
+}
+
+function applyToolPrompt(prompt, body) {
+  const tools = normalizeEmulatableTools(body.tools);
+  if (!tools.length) return prompt;
+
+  const toolChoice = stringifyToolChoice(body.tool_choice);
+  const toolGuide = [
+    "You can call client-side tools exposed by the agent or IDE.",
+    "When a tool is needed, respond with only one fenced code block labeled tool_calls and valid JSON.",
+    "Required format:",
+    "```tool_calls",
+    '[{"name":"tool_name","arguments":{"example":"value"}}]',
+    "```",
+    "Do not add prose before or after the tool_calls block.",
+    "If tool results are already present in the conversation, use them and continue normally unless another tool call is still required.",
+    `tool_choice: ${toolChoice}`,
+    `available_tools: ${JSON.stringify(tools)}`,
+  ].join("\n");
+
+  return [toolGuide, prompt].filter(Boolean).join("\n\n");
+}
+
+function stringifyToolChoice(toolChoice) {
+  if (!toolChoice) return "auto";
+  if (typeof toolChoice === "string") return toolChoice;
+  if (toolChoice.function && toolChoice.function.name) return `function:${toolChoice.function.name}`;
+  if (toolChoice.name) return `tool:${toolChoice.name}`;
+  return JSON.stringify(toolChoice);
+}
+
+function parseToolCallsFromText(text, tools) {
+  if (!text) return [];
+  const availableNames = new Set(normalizeEmulatableTools(tools).map((tool) => tool.name));
+  if (!availableNames.size) return [];
+
+  const candidates = [];
+  const fenceRegex = /```tool_calls\s*([\s\S]*?)```/gi;
+  for (const match of text.matchAll(fenceRegex)) {
+    candidates.push(match[1].trim());
+  }
+
+  const xmlRegex = /<tool_call>([\s\S]*?)<\/tool_call>/gi;
+  for (const match of text.matchAll(xmlRegex)) {
+    candidates.push(match[1].trim());
+  }
+
+  if (!candidates.length && /^[\s\r\n]*[\[{]/.test(text)) {
+    candidates.push(text.trim());
+  }
+
+  for (const candidate of candidates) {
+    const parsed = safeJsonParse(candidate, null);
+    const normalized = normalizeParsedToolCalls(parsed, availableNames);
+    if (normalized.length) return normalized;
+  }
+
+  return [];
+}
+
+function normalizeParsedToolCalls(value, availableNames) {
+  const rawCalls = Array.isArray(value)
+    ? value
+    : Array.isArray(value && value.tool_calls)
+      ? value.tool_calls
+      : value && typeof value === "object"
+        ? [value]
+        : [];
+
+  return rawCalls.map((call) => normalizeParsedToolCall(call, availableNames)).filter(Boolean);
+}
+
+function normalizeParsedToolCall(call, availableNames) {
+  if (!call || typeof call !== "object") return null;
+  const name = call.name || call.tool_name || (call.function && call.function.name);
+  if (!name || (availableNames && !availableNames.has(name))) return null;
+
+  let argumentsValue =
+    call.arguments != null ? call.arguments :
+      call.input != null ? call.input :
+        call.parameters != null ? call.parameters :
+          call.args != null ? call.args :
+            (call.function && call.function.arguments != null ? call.function.arguments : {});
+
+  if (typeof argumentsValue === "string") {
+    const parsed = safeJsonParse(argumentsValue, argumentsValue);
+    argumentsValue = parsed;
+  }
+
+  const argumentsText = typeof argumentsValue === "string" ? argumentsValue : JSON.stringify(argumentsValue || {});
+
+  return {
+    id: call.id || call.call_id || `call_${randomId()}`,
+    type: "function",
+    function: {
+      name,
+      arguments: argumentsText,
+    },
+  };
+}
+
+function stripToolCallMarkup(text) {
+  return String(text || "")
+    .replace(/```tool_calls\s*[\s\S]*?```/gi, "")
+    .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, "")
+    .trim();
+}
+
+function safeJsonParse(value, fallback) {
+  if (typeof value !== "string") return value == null ? fallback : value;
+  try {
+    return JSON.parse(value);
+  } catch (_) {
+    return fallback;
+  }
 }
 
 async function proxyUpstream(request, env, path) {
@@ -540,14 +1027,25 @@ async function collectUnlimitedText(request, env, path, payload) {
   let text = "";
   let finishReason = "stop";
   const annotations = [];
+  let toolCalls = null;
 
   for (const event of events) {
     if (typeof event.delta === "string") text += event.delta;
     if (event.results) annotations.push(event.results);
     if (event.finish && event.reason) finishReason = event.reason;
+    if (event.choices && event.choices[0]) {
+      const choice = event.choices[0];
+      if (choice.message && choice.message.content) text += choice.message.content;
+      if (choice.delta && choice.delta.content) text += choice.delta.content;
+      if (choice.finish_reason) finishReason = choice.finish_reason;
+      if (choice.message && choice.message.tool_calls) toolCalls = choice.message.tool_calls;
+      if (choice.delta && choice.delta.tool_calls) {
+        if (!toolCalls) toolCalls = choice.delta.tool_calls;
+      }
+    }
   }
 
-  return { text, finishReason, annotations, rawEvents: events };
+  return { text, finishReason, annotations, rawEvents: events, toolCalls };
 }
 
 async function getModelCatalog(request, env) {
@@ -581,16 +1079,48 @@ function streamOpenAIChat(upstream, meta) {
         choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
       });
     },
-    delta(controller, text) {
-      writeSse(controller, {
-        id: meta.id,
-        object: "chat.completion.chunk",
-        created: meta.created,
-        model: meta.model,
-        choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
-      });
+    delta(controller, text, parsed) {
+      if (parsed && parsed.choices) {
+        writeSse(controller, {
+          id: meta.id,
+          object: "chat.completion.chunk",
+          created: meta.created,
+          model: meta.model,
+          choices: parsed.choices
+        });
+        return;
+      }
+
+      const deltaObj = {};
+      if (text) deltaObj.content = text;
+      if (parsed && parsed.tool_calls) deltaObj.tool_calls = parsed.tool_calls;
+      if (parsed && parsed.delta && typeof parsed.delta === "object" && parsed.delta.tool_calls) {
+        deltaObj.tool_calls = parsed.delta.tool_calls;
+      }
+
+      if (Object.keys(deltaObj).length > 0) {
+        writeSse(controller, {
+          id: meta.id,
+          object: "chat.completion.chunk",
+          created: meta.created,
+          model: meta.model,
+          choices: [{ index: 0, delta: deltaObj, finish_reason: null }],
+        });
+      }
     },
-    finish(controller, reason) {
+    finish(controller, reason, parsed) {
+      if (parsed && parsed.choices && parsed.choices[0] && parsed.choices[0].finish_reason) {
+        writeSse(controller, {
+          id: meta.id,
+          object: "chat.completion.chunk",
+          created: meta.created,
+          model: meta.model,
+          choices: [{ index: 0, delta: {}, finish_reason: parsed.choices[0].finish_reason }],
+        });
+        writeRawSse(controller, "data: [DONE]\n\n");
+        return;
+      }
+
       writeSse(controller, {
         id: meta.id,
         object: "chat.completion.chunk",
@@ -691,14 +1221,26 @@ function streamAnthropicMessages(upstream, meta) {
         content_block: { type: "text", text: "" },
       });
     },
-    delta(controller, text) {
-      writeSseEvent(controller, "content_block_delta", {
-        type: "content_block_delta",
-        index: 0,
-        delta: { type: "text_delta", text },
-      });
+    delta(controller, text, parsed) {
+      if (parsed && (parsed.type === "content_block_delta" || parsed.type === "message_delta" || parsed.type === "content_block_start" || parsed.type === "content_block_stop")) {
+        writeSseEvent(controller, parsed.type, parsed);
+        return;
+      }
+
+      if (text) {
+        writeSseEvent(controller, "content_block_delta", {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "text_delta", text },
+        });
+      }
     },
-    finish(controller, reason) {
+    finish(controller, reason, parsed) {
+      if (parsed && parsed.type === "message_stop") {
+        writeSseEvent(controller, "message_stop", parsed);
+        return;
+      }
+
       writeSseEvent(controller, "content_block_stop", { type: "content_block_stop", index: 0 });
       writeSseEvent(controller, "message_delta", {
         type: "message_delta",
@@ -735,13 +1277,31 @@ function streamUnlimitedEvents(upstream, handlers) {
             const parsed = parseSseJson(line.slice(5).trim());
             if (!parsed) continue;
 
-            if (typeof parsed.delta === "string" && parsed.delta.length) {
-              handlers.delta && handlers.delta(controller, parsed.delta, parsed);
+            if (parsed.error) {
+              controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({ error: parsed.error.message || parsed.error })}\n\n`));
+              finished = true;
+              break;
             }
 
-            if (parsed.finish || parsed.done) {
+            let hasDelta = false;
+            let deltaText = "";
+
+            if (typeof parsed.delta === "string" && parsed.delta.length) {
+              deltaText = parsed.delta;
+              hasDelta = true;
+            } else if (parsed.delta != null || parsed.choices != null || parsed.tool_calls != null || parsed.type != null) {
+              hasDelta = true;
+            }
+
+            if (hasDelta) {
+              handlers.delta && handlers.delta(controller, deltaText, parsed);
+            }
+
+            if (parsed.finish || parsed.done || (parsed.choices && parsed.choices[0] && parsed.choices[0].finish_reason)) {
               finished = true;
-              handlers.finish && handlers.finish(controller, parsed.reason || "stop", parsed);
+              let reason = parsed.reason || "stop";
+              if (parsed.choices && parsed.choices[0] && parsed.choices[0].finish_reason) reason = parsed.choices[0].finish_reason;
+              handlers.finish && handlers.finish(controller, reason, parsed);
             }
           }
         }
@@ -934,586 +1494,14 @@ function normalizePath(path) {
 
 function messagesToText(messages) {
   if (!Array.isArray(messages)) return "";
-  return messages.map((message) => {
-    const role = message.role || "user";
-    if (role === "assistant" && Array.isArray(message.tool_calls) && message.tool_calls.length) {
-      return `assistant: [tool_calls] ${JSON.stringify(message.tool_calls)}`;
-    }
-    if (role === "assistant" && message.function_call) {
-      return `assistant: [function_call] ${JSON.stringify(message.function_call)}`;
-    }
-    if (role === "tool") {
-      return `tool (${message.tool_call_id || message.name || "result"}): ${contentToText(message.content)}`;
-    }
-    return `${role}: ${contentToText(message.content)}`;
-  }).filter(Boolean).join("\n\n");
-}
-
-function buildChatMessageText(body) {
-  const parts = [];
-  if (body.system) parts.push(`system: ${contentToText(body.system)}`);
-  if (body.instructions) parts.push(`system: ${contentToText(body.instructions)}`);
-  if (body.message) {
-    parts.push(body.message);
-  } else if (Array.isArray(body.messages)) {
-    parts.push(messagesToText(body.messages));
-  } else if (body.input) {
-    parts.push(inputToText(body.input));
-  } else if (body.prompt) {
-    parts.push(body.prompt);
-  }
-
-  const clientTools = getClientTools(body.tools);
-  if (clientTools.length) {
-    parts.push(`available tools: ${JSON.stringify(clientTools)}`);
-    parts.push(TOOL_CALL_INSTRUCTION);
-  }
-
-  return parts.filter(Boolean).join("\n\n");
+  return messages.map(messageToTranscript).filter(Boolean).join("\n\n");
 }
 
 function anthropicMessagesToText(body) {
-  return buildChatMessageText(body);
-}
-
-function getClientTools(tools) {
-  if (!Array.isArray(tools)) return [];
-  return tools.filter((tool) => !isWebSearchTool(tool)).map(normalizeToolDefinition);
-}
-
-function hasClientTools(tools) {
-  return getClientTools(tools).length > 0;
-}
-
-function isWebSearchTool(tool) {
-  const type = tool && (tool.type || tool.name || (tool.function && tool.function.name));
-  return /web.?search|browser|search/i.test(String(type || ""));
-}
-
-function normalizeToolDefinition(tool) {
-  if (!tool || typeof tool !== "object") return tool;
-  if (tool.type === "function" && tool.function) return tool;
-  if (tool.name) {
-    return {
-      type: "function",
-      function: {
-        name: tool.name,
-        description: tool.description || "",
-        parameters: tool.input_schema || tool.parameters || { type: "object", properties: {} },
-      },
-    };
-  }
-  return tool;
-}
-
-function parseToolCallsFromText(text) {
-  if (!text || typeof text !== "string") return null;
-
-  const candidates = collectJsonCandidates(text.trim());
-  for (const candidate of candidates) {
-    const parsed = tryParseJson(candidate);
-    if (!parsed) continue;
-
-    if (Array.isArray(parsed.tool_calls) && parsed.tool_calls.length) {
-      return normalizeToolCalls(parsed.tool_calls);
-    }
-
-    if (parsed.name && (parsed.arguments != null || parsed.parameters != null || parsed.input != null)) {
-      return normalizeToolCalls([{
-        id: parsed.id,
-        type: "function",
-        function: {
-          name: parsed.name,
-          arguments: parsed.arguments ?? parsed.parameters ?? parsed.input,
-        },
-      }]);
-    }
-
-    if (parsed.type === "tool_use" && parsed.name) {
-      return normalizeToolCalls([anthropicToolUseToOpenAI(parsed)]);
-    }
-
-    if (Array.isArray(parsed.content)) {
-      const toolUses = parsed.content.filter((item) => item && item.type === "tool_use");
-      if (toolUses.length) return normalizeToolCalls(toolUses.map(anthropicToolUseToOpenAI));
-    }
-
-    if (Array.isArray(parsed) && parsed.length && parsed[0] && (parsed[0].name || parsed[0].function)) {
-      return normalizeToolCalls(parsed);
-    }
-  }
-
-  const xmlCalls = parseXmlToolCalls(text);
-  if (xmlCalls.length) return normalizeToolCalls(xmlCalls);
-
-  return null;
-}
-
-function parseXmlToolCalls(text) {
-  const calls = [];
-  const toolCallPattern = /<tool_call>\s*<name>([^<]+)<\/name>\s*<arguments>([\s\S]*?)<\/arguments>\s*<\/tool_call>/gi;
-  let match = toolCallPattern.exec(text);
-  while (match) {
-    calls.push({
-      type: "function",
-      function: { name: match[1].trim(), arguments: match[2].trim() },
-    });
-    match = toolCallPattern.exec(text);
-  }
-
-  const invokePattern = /<invoke\s+name="([^"]+)">([\s\S]*?)<\/invoke>/gi;
-  match = invokePattern.exec(text);
-  while (match) {
-    const params = {};
-    const paramPattern = /<parameter\s+name="([^"]+)">([\s\S]*?)<\/parameter>/gi;
-    let paramMatch = paramPattern.exec(match[2]);
-    while (paramMatch) {
-      params[paramMatch[1]] = paramMatch[2].trim();
-      paramMatch = paramPattern.exec(match[2]);
-    }
-    calls.push({
-      type: "function",
-      function: { name: match[1].trim(), arguments: params },
-    });
-    match = invokePattern.exec(text);
-  }
-
-  return calls;
-}
-
-function collectJsonCandidates(text) {
-  const candidates = [text];
-  const codeBlocks = text.match(/```(?:json)?\s*([\s\S]*?)```/g) || [];
-  for (const block of codeBlocks) {
-    candidates.push(block.replace(/```(?:json)?\s*/i, "").replace(/```$/, "").trim());
-  }
-
-  const toolCallsMatch = text.match(/\{[\s\S]*"tool_calls"\s*:\s*\[[\s\S]*?\][\s\S]*?\}/);
-  if (toolCallsMatch) candidates.push(toolCallsMatch[0]);
-
-  const toolUseMatch = text.match(/\{[\s\S]*"type"\s*:\s*"tool_use"[\s\S]*?\}/);
-  if (toolUseMatch) candidates.push(toolUseMatch[0]);
-
-  return [...new Set(candidates.filter(Boolean))];
-}
-
-function tryParseJson(value) {
-  try {
-    return JSON.parse(value);
-  } catch (_) {
-    return null;
-  }
-}
-
-function normalizeToolCalls(toolCalls) {
-  return toolCalls.map((toolCall) => {
-    const fn = toolCall.function || {};
-    const name = fn.name || toolCall.name || "";
-    let args = fn.arguments;
-    if (args == null) args = toolCall.input || toolCall.arguments || {};
-    if (typeof args !== "string") args = JSON.stringify(args);
-
-    return {
-      id: toolCall.id || `call_${randomId()}`,
-      type: toolCall.type || "function",
-      function: { name, arguments: args },
-    };
-  }).filter((toolCall) => toolCall.function.name);
-}
-
-function anthropicToolUseToOpenAI(toolUse) {
-  return {
-    id: toolUse.id || `toolu_${randomId()}`,
-    type: "function",
-    function: {
-      name: toolUse.name,
-      arguments: JSON.stringify(toolUse.input || {}),
-    },
-  };
-}
-
-function toolCallsToAnthropicContent(toolCalls) {
-  return toolCalls.map((toolCall) => {
-    let input = {};
-    try {
-      input = JSON.parse(toolCall.function.arguments || "{}");
-    } catch (_) {
-      input = { raw: toolCall.function.arguments || "" };
-    }
-
-    return {
-      type: "tool_use",
-      id: toolCall.id,
-      name: toolCall.function.name,
-      input,
-    };
-  });
-}
-
-function buildOpenAIToolCompletion({ id, created, model, toolCalls, inputText }) {
-  return {
-    id,
-    object: "chat.completion",
-    created,
-    model,
-    choices: [
-      {
-        index: 0,
-        message: {
-          role: "assistant",
-          content: null,
-          tool_calls: toolCalls,
-        },
-        logprobs: null,
-        finish_reason: "tool_calls",
-      },
-    ],
-    usage: usageFromText(inputText, JSON.stringify(toolCalls)),
-    system_fingerprint: "unlimited-surf-worker:tools",
-  };
-}
-
-function buildAnthropicToolMessage({ id, model, toolCalls, inputText }) {
-  return {
-    id,
-    type: "message",
-    role: "assistant",
-    model,
-    content: toolCallsToAnthropicContent(toolCalls),
-    stop_reason: "tool_use",
-    stop_sequence: null,
-    usage: anthropicUsageFromText(inputText, JSON.stringify(toolCalls)),
-  };
-}
-
-function buildOpenAIResponsesToolResult({ id, created, model, body, toolCalls, inputText }) {
-  const output = toolCalls.map((toolCall) => ({
-    id: `fc_${randomId()}`,
-    type: "function_call",
-    status: "completed",
-    call_id: toolCall.id,
-    name: toolCall.function.name,
-    arguments: toolCall.function.arguments,
-  }));
-
-  return {
-    id,
-    object: "response",
-    created_at: created,
-    status: "completed",
-    error: null,
-    incomplete_details: null,
-    instructions: body.instructions || null,
-    max_output_tokens: body.max_output_tokens || body.max_tokens || null,
-    model,
-    output,
-    output_text: "",
-    parallel_tool_calls: true,
-    previous_response_id: body.previous_response_id || null,
-    reasoning: body.reasoning || null,
-    store: body.store || false,
-    temperature: body.temperature || null,
-    text: body.text || { format: { type: "text" } },
-    tool_choice: body.tool_choice || "auto",
-    tools: body.tools || [],
-    top_p: body.top_p || null,
-    truncation: body.truncation || "disabled",
-    usage: responseUsageFromText(inputText, JSON.stringify(toolCalls)),
-    user: body.user || null,
-  };
-}
-
-function streamOpenAIChatWithTools(upstream, meta) {
-  const encoder = new TextEncoder();
-
-  return new ReadableStream({
-    async start(controller) {
-      try {
-        const events = await readUnlimitedEvents(upstream);
-        let text = "";
-        for (const event of events) {
-          if (typeof event.delta === "string") text += event.delta;
-        }
-
-        const toolCalls = parseToolCallsFromText(text);
-        if (toolCalls) {
-          writeSse(controller, {
-            id: meta.id,
-            object: "chat.completion.chunk",
-            created: meta.created,
-            model: meta.model,
-            choices: [{ index: 0, delta: { role: "assistant", content: null }, finish_reason: null }],
-          });
-
-          for (let index = 0; index < toolCalls.length; index += 1) {
-            const toolCall = toolCalls[index];
-            writeSse(controller, {
-              id: meta.id,
-              object: "chat.completion.chunk",
-              created: meta.created,
-              model: meta.model,
-              choices: [{
-                index: 0,
-                delta: {
-                  tool_calls: [{
-                    index,
-                    id: toolCall.id,
-                    type: "function",
-                    function: {
-                      name: toolCall.function.name,
-                      arguments: toolCall.function.arguments,
-                    },
-                  }],
-                },
-                finish_reason: null,
-              }],
-            });
-          }
-
-          writeSse(controller, {
-            id: meta.id,
-            object: "chat.completion.chunk",
-            created: meta.created,
-            model: meta.model,
-            choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
-          });
-        } else {
-          writeSse(controller, {
-            id: meta.id,
-            object: "chat.completion.chunk",
-            created: meta.created,
-            model: meta.model,
-            choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
-          });
-          if (text) {
-            writeSse(controller, {
-              id: meta.id,
-              object: "chat.completion.chunk",
-              created: meta.created,
-              model: meta.model,
-              choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
-            });
-          }
-          writeSse(controller, {
-            id: meta.id,
-            object: "chat.completion.chunk",
-            created: meta.created,
-            model: meta.model,
-            choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-          });
-        }
-
-        writeRawSse(controller, "data: [DONE]\n\n");
-      } catch (error) {
-        controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({ error: error.message || String(error) })}\n\n`));
-      } finally {
-        controller.close();
-      }
-    },
-  });
-}
-
-function streamOpenAIResponsesWithTools(upstream, meta) {
-  const encoder = new TextEncoder();
-
-  return new ReadableStream({
-    async start(controller) {
-      try {
-        const events = await readUnlimitedEvents(upstream);
-        let text = "";
-        for (const event of events) {
-          if (typeof event.delta === "string") text += event.delta;
-        }
-
-        const toolCalls = parseToolCallsFromText(text);
-        writeSseEvent(controller, "response.created", {
-          type: "response.created",
-          response: {
-            id: meta.id,
-            object: "response",
-            created_at: meta.created,
-            status: "in_progress",
-            model: meta.model,
-            output: [],
-          },
-        });
-
-        if (toolCalls) {
-          for (let outputIndex = 0; outputIndex < toolCalls.length; outputIndex += 1) {
-            const toolCall = toolCalls[outputIndex];
-            const itemId = `fc_${randomId()}`;
-            writeSseEvent(controller, "response.output_item.added", {
-              type: "response.output_item.added",
-              output_index: outputIndex,
-              item: {
-                id: itemId,
-                type: "function_call",
-                status: "in_progress",
-                call_id: toolCall.id,
-                name: toolCall.function.name,
-                arguments: "",
-              },
-            });
-            writeSseEvent(controller, "response.function_call_arguments.delta", {
-              type: "response.function_call_arguments.delta",
-              item_id: itemId,
-              output_index: outputIndex,
-              delta: toolCall.function.arguments,
-            });
-            writeSseEvent(controller, "response.function_call_arguments.done", {
-              type: "response.function_call_arguments.done",
-              item_id: itemId,
-              output_index: outputIndex,
-              arguments: toolCall.function.arguments,
-            });
-            writeSseEvent(controller, "response.output_item.done", {
-              type: "response.output_item.done",
-              output_index: outputIndex,
-              item: {
-                id: itemId,
-                type: "function_call",
-                status: "completed",
-                call_id: toolCall.id,
-                name: toolCall.function.name,
-                arguments: toolCall.function.arguments,
-              },
-            });
-          }
-        } else {
-          const outputId = `msg_${randomId()}`;
-          writeSseEvent(controller, "response.output_item.added", {
-            type: "response.output_item.added",
-            output_index: 0,
-            item: { id: outputId, type: "message", status: "in_progress", role: "assistant", content: [] },
-          });
-          writeSseEvent(controller, "response.content_part.added", {
-            type: "response.content_part.added",
-            item_id: outputId,
-            output_index: 0,
-            content_index: 0,
-            part: { type: "output_text", text: "", annotations: [] },
-          });
-          if (text) {
-            writeSseEvent(controller, "response.output_text.delta", {
-              type: "response.output_text.delta",
-              item_id: outputId,
-              output_index: 0,
-              content_index: 0,
-              delta: text,
-            });
-          }
-          writeSseEvent(controller, "response.output_text.done", {
-            type: "response.output_text.done",
-            item_id: outputId,
-            output_index: 0,
-            content_index: 0,
-            text,
-          });
-          writeSseEvent(controller, "response.content_part.done", {
-            type: "response.content_part.done",
-            item_id: outputId,
-            output_index: 0,
-            content_index: 0,
-            part: { type: "output_text", text, annotations: [] },
-          });
-          writeSseEvent(controller, "response.output_item.done", {
-            type: "response.output_item.done",
-            output_index: 0,
-            item: { id: outputId, type: "message", status: "completed", role: "assistant", content: [] },
-          });
-        }
-
-        writeSseEvent(controller, "response.completed", {
-          type: "response.completed",
-          response: { id: meta.id, object: "response", created_at: meta.created, status: "completed", model: meta.model },
-        });
-        writeRawSse(controller, "data: [DONE]\n\n");
-      } catch (error) {
-        controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({ error: error.message || String(error) })}\n\n`));
-      } finally {
-        controller.close();
-      }
-    },
-  });
-}
-
-function streamAnthropicMessagesWithTools(upstream, meta) {
-  const encoder = new TextEncoder();
-
-  return new ReadableStream({
-    async start(controller) {
-      try {
-        const events = await readUnlimitedEvents(upstream);
-        let text = "";
-        for (const event of events) {
-          if (typeof event.delta === "string") text += event.delta;
-        }
-
-        const toolCalls = parseToolCallsFromText(text);
-        writeSseEvent(controller, "message_start", {
-          type: "message_start",
-          message: {
-            id: meta.id,
-            type: "message",
-            role: "assistant",
-            model: meta.model,
-            content: [],
-            stop_reason: null,
-            stop_sequence: null,
-            usage: { input_tokens: 0, output_tokens: 0 },
-          },
-        });
-
-        if (toolCalls) {
-          const content = toolCallsToAnthropicContent(toolCalls);
-          for (let index = 0; index < content.length; index += 1) {
-            const block = content[index];
-            writeSseEvent(controller, "content_block_start", {
-              type: "content_block_start",
-              index,
-              content_block: { type: "tool_use", id: block.id, name: block.name, input: {} },
-            });
-            writeSseEvent(controller, "content_block_delta", {
-              type: "content_block_delta",
-              index,
-              delta: { type: "input_json_delta", partial_json: JSON.stringify(block.input) },
-            });
-            writeSseEvent(controller, "content_block_stop", { type: "content_block_stop", index });
-          }
-          writeSseEvent(controller, "message_delta", {
-            type: "message_delta",
-            delta: { stop_reason: "tool_use", stop_sequence: null },
-            usage: { output_tokens: 0 },
-          });
-        } else {
-          writeSseEvent(controller, "content_block_start", {
-            type: "content_block_start",
-            index: 0,
-            content_block: { type: "text", text: "" },
-          });
-          if (text) {
-            writeSseEvent(controller, "content_block_delta", {
-              type: "content_block_delta",
-              index: 0,
-              delta: { type: "text_delta", text },
-            });
-          }
-          writeSseEvent(controller, "content_block_stop", { type: "content_block_stop", index: 0 });
-          writeSseEvent(controller, "message_delta", {
-            type: "message_delta",
-            delta: { stop_reason: "end_turn", stop_sequence: null },
-            usage: { output_tokens: 0 },
-          });
-        }
-
-        writeSseEvent(controller, "message_stop", { type: "message_stop" });
-      } catch (error) {
-        controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({ error: error.message || String(error) })}\n\n`));
-      } finally {
-        controller.close();
-      }
-    },
-  });
+  const parts = [];
+  if (body.system) parts.push(`system: ${contentToText(body.system)}`);
+  if (Array.isArray(body.messages)) parts.push(messagesToText(body.messages));
+  return parts.filter(Boolean).join("\n\n");
 }
 
 function inputToText(input) {
@@ -1523,18 +1511,20 @@ function inputToText(input) {
 
   return input.map((item) => {
     if (typeof item === "string") return item;
-    if (item.type === "message") return `${item.role || "user"}: ${contentToText(item.content)}`;
-    if (item.role) return `${item.role}: ${contentToText(item.content)}`;
-    if (item.type === "input_text" || item.type === "output_text") return item.text || "";
+    if (item.type === "message") return messageToTranscript(item);
+    if (item.role) return messageToTranscript(item);
     if (item.type === "function_call") {
-      return `[function_call ${item.name || item.call_id || ""}] ${item.arguments || JSON.stringify(item)}`;
+      return `assistant tool_call: ${JSON.stringify({
+        id: item.call_id || item.id || "",
+        name: item.name || item.function?.name || "tool",
+        arguments: item.arguments || item.function?.arguments || {},
+      })}`;
     }
     if (item.type === "function_call_output") {
-      return `[function_call_output ${item.call_id || ""}] ${contentToText(item.output)}`;
+      return `tool (${item.name || item.tool_name || "tool"}) result for ${item.call_id || item.id || ""}: ${contentToText(item.output || item.content)}`;
     }
-    if (item.type === "tool_result" || item.type === "function_call_result") {
-      return `[tool_result ${item.tool_use_id || item.call_id || ""}] ${contentToText(item.content || item.output)}`;
-    }
+    if (item.type === "input_file") return formatFileReference(item);
+    if (item.type === "input_text" || item.type === "output_text") return item.text || "";
     return contentToText(item);
   }).filter(Boolean).join("\n\n");
 }
@@ -1550,15 +1540,68 @@ function contentToText(content) {
     if (typeof content.input_text === "string") return content.input_text;
     if (content.type === "text" && typeof content.text === "string") return content.text;
     if (content.type === "input_text" && typeof content.text === "string") return content.text;
-    if (content.type === "image_url") return `[image: ${content.image_url && content.image_url.url ? content.image_url.url : "attached"}]`;
+    if (content.type === "input_file" || content.type === "file" || content.file_id || content.filename || content.file_name) {
+      return formatFileReference(content);
+    }
+    if (content.type === "image_url") {
+      let url = content.image_url && content.image_url.url ? content.image_url.url : "attached";
+      if (url.startsWith("data:") && url.length > 200) {
+        url = url.substring(0, 100) + "...[truncated to prevent payload overflow]";
+      }
+      return `[image: ${url}]`;
+    }
     if (content.type === "image") return "[image attached]";
     if (content.type === "tool_result") return `[tool_result ${content.tool_use_id || ""}] ${contentToText(content.content)}`;
     if (content.type === "tool_use") return `[tool_use ${content.name || "tool"}] ${JSON.stringify(content.input || {})}`;
-    if (content.type === "function_call") return `[function_call ${content.name || ""}] ${content.arguments || ""}`;
-    if (content.type === "function_call_output") return `[function_output ${content.call_id || ""}] ${contentToText(content.output)}`;
+    if (content.type === "function_call_output") return `[tool_result ${content.call_id || content.id || ""}] ${contentToText(content.output || content.content)}`;
+    if (content.type === "function_call") {
+      return `[tool_use ${content.name || content.function?.name || "tool"}] ${JSON.stringify(content.arguments || content.function?.arguments || {})}`;
+    }
     if (content.type) return `[${content.type}] ${JSON.stringify(content)}`;
   }
   return String(content);
+}
+
+function messageToTranscript(message) {
+  if (!message || typeof message !== "object") return "";
+  const role = message.role || "user";
+  const parts = [];
+  const contentText = contentToText(message.content);
+
+  if (role === "tool") {
+    return `tool (${message.name || message.tool_name || "tool"}) result for ${message.tool_call_id || ""}: ${contentText}`;
+  }
+
+  if (contentText) parts.push(`${role}: ${contentText}`);
+
+  if (role === "assistant") {
+    if (message.function_call) {
+      parts.push(`assistant tool_call: ${JSON.stringify({
+        name: message.function_call.name || "tool",
+        arguments: message.function_call.arguments || {},
+      })}`);
+    }
+
+    if (Array.isArray(message.tool_calls)) {
+      for (const toolCall of message.tool_calls) {
+        parts.push(`assistant tool_call: ${JSON.stringify({
+          id: toolCall.id || "",
+          name: toolCall.function?.name || toolCall.name || "tool",
+          arguments: toolCall.function?.arguments || toolCall.arguments || {},
+        })}`);
+      }
+    }
+  }
+
+  return parts.join("\n");
+}
+
+function formatFileReference(fileLike) {
+  const fileId = fileLike.file_id || fileLike.id || "";
+  const fileName = fileLike.filename || fileLike.file_name || fileLike.name || "";
+  const mediaType = fileLike.mime_type || fileLike.type || fileLike.media_type || "";
+  const source = fileLike.url || fileLike.file_url || "";
+  return `[file id=${fileId || "n/a"} name=${fileName || "unknown"} type=${mediaType || "unknown"} source=${source || "local"}]`;
 }
 
 function latestUserText(messages) {
@@ -1571,7 +1614,10 @@ function latestUserText(messages) {
 
 function hasWebSearchTool(tools) {
   if (!Array.isArray(tools)) return false;
-  return tools.some((tool) => isWebSearchTool(tool));
+  return tools.some((tool) => {
+    const type = tool && (tool.type || tool.name || (tool.function && tool.function.name));
+    return /web.?search|browser|search/i.test(String(type || ""));
+  });
 }
 
 function reasoningEffort(body) {
